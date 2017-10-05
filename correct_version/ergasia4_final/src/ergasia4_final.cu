@@ -17,8 +17,69 @@
 #define threads_per_warp 32
 #define num_of_threads 256
 
-__device__ void sigmoid(float& z){
-	z = 1.0 / (1.0 + exp(-(z))) ;
+__device__ void sigmoid(float& z) {
+	z = 1.0 / (1.0 + exp(-(z)));
+}
+
+__device__ void backpropagate_some_cols(float* result, int rows_per_block,
+		int col_length, float* matrix, float* vector, int last_block, int size,
+		float* sigm_der) {
+	// README :
+	// each block uses rows threads
+	// each block modifies rows columns ( cols columns per block)
+	// each thread modifies one column , column's length is col_length
+	// cols : number of columns that this block will modify
+	// one last block has less job to do, this one takes parameter last_block == 1
+	// and size (after index exceeds size in last block, no computation must be made)
+
+	int thread_id = threadIdx.y * blockDim.x + threadIdx.x;
+	int block_id = blockIdx.x;
+
+	extern __shared__ float shared[];
+	float* temp = shared;
+	float* m = &temp[rows_per_block];
+	float* v = &m[col_length * rows_per_block];
+	float* res = &v[col_length * rows_per_block];
+
+	// move data in shared memory
+	for (int i = thread_id * col_length;
+			i < thread_id * col_length + col_length; i++) {
+		m[i] = matrix[i];
+	}
+	v[thread_id] = 0;
+	v[thread_id] = vector[thread_id] * (thread_id < col_length);
+
+	__syncthreads();
+
+	int cnt = 0;
+	for (int i = thread_id * col_length;
+			i < thread_id * col_length + col_length; i++) {
+		m[i] = m[i] * v[cnt];
+		cnt++;
+	}
+	__syncthreads();
+
+	temp[thread_id] = 0;
+	for (int i = thread_id * col_length;
+			i < thread_id * col_length + col_length; i++) {
+		temp[thread_id] += m[i];
+
+	}
+	__syncthreads();
+	result[thread_id] = temp[thread_id] * sigm_der[thread_id];
+
+}
+
+__global__ void backpropagate(float* result, int rows_per_block, int col_length,
+		float* matrix, float* vector, int last_block, int size,
+		float* sigm_der) {
+	int block_id = blockIdx.y * gridDim.x + blockIdx.x;
+	int thread_id = threadIdx.y * blockDim.x + threadIdx.x;
+	backpropagate_some_cols(&result[block_id * rows_per_block], rows_per_block,
+			col_length, &matrix[block_id * rows_per_block], vector,
+			(block_id == last_block), size,
+			&sigm_der[block_id * rows_per_block]);
+
 }
 
 __device__ void hadamard_product_small(float* sh_a, float* sh_b, float* sh_res,
@@ -27,14 +88,14 @@ __device__ void hadamard_product_small(float* sh_a, float* sh_b, float* sh_res,
 	// start the computations
 	for (int i = thread_id * multiplier;
 			i < thread_id * multiplier + multiplier; i++) {
-		sh_res[i] = sh_b[i] * sh_a[i] * ((int)(i < size));
+		sh_res[i] = sh_b[i] * sh_a[i] * ((int) (i < size));
 	}
 	// result is stored in sh_b vector\
 	//done
 }
 
-__device__ void array_sum_small(float* sha, float& result,
-		int size, int start) {
+__device__ void array_sum_small(float* sha, float& result, int size,
+		int start) {
 	int thread_id = threadIdx.y * blockDim.x + threadIdx.x;
 
 	// start the computations
@@ -45,7 +106,8 @@ __device__ void array_sum_small(float* sha, float& result,
 			// thread_id  % i == even
 			// add the "more next vector"
 			sha[thread_id] = sha[thread_id]
-					+ sha[i + thread_id] * ((int)(start + thread_id + i < size));
+					+ sha[i + thread_id]
+							* ((int) (start + thread_id + i < size));
 			break;
 		default:
 			// thread_id  % i == odd
@@ -79,40 +141,42 @@ __device__ void array_sum_small(float* sha, float& result,
 }
 
 __device__ void mull_feedforward_one_col(float* result, int rows, int cols,
-		float* matrix, float* vector, int multiplier,int size,float bias,float* sigm_der) {
+		float* matrix, float* vector, int multiplier, int size, float bias,
+		float* sigm_der) {
 
 	int thread_id = threadIdx.y * blockDim.x + threadIdx.x;
 	int block_id = blockIdx.y * gridDim.x + blockIdx.x;
 	extern __shared__ float shared[];
 	float* temp = shared;
-	float* m = &temp[rows * multiplier ];
+	float* m = &temp[rows * multiplier];
 	float* v = &m[rows * multiplier];
 	float* res = &v[rows * multiplier];
 
 	for (int i = thread_id * multiplier;
 			i < thread_id * multiplier + multiplier; i++) {
-		m[i] = matrix[i]*((i<size));
+		m[i] = matrix[i] * ((i < size));
 
 	}
 	for (int i = thread_id * multiplier;
 			i < thread_id * multiplier + multiplier; i++) {
-		v[i] = vector[i]*((i<size));
+		v[i] = vector[i] * ((i < size));
 	}
 	for (int i = thread_id * multiplier;
 			i < thread_id * multiplier + multiplier; i++) {
 		res[i] = 0.0;
 	}
 	for (int i = thread_id * multiplier;
-				i < thread_id * multiplier + multiplier; i++) {
-			temp[i] = 0.0;
+			i < thread_id * multiplier + multiplier; i++) {
+		temp[i] = 0.0;
 	}
 	__syncthreads();
 
 	hadamard_product_small(m, v, temp, multiplier, size);
 	__syncthreads();
 
-	for (int i = multiplier-1; i >=0; i--) {
-		array_sum_small(&temp[i*num_of_threads],res[0], size, (i * num_of_threads));
+	for (int i = multiplier - 1; i >= 0; i--) {
+		array_sum_small(&temp[i * num_of_threads], res[0], size,
+				(i * num_of_threads));
 		__syncthreads();
 	}
 
@@ -120,15 +184,28 @@ __device__ void mull_feedforward_one_col(float* result, int rows, int cols,
 		float tmp = (res[thread_id] + bias);
 		sigmoid(tmp);
 		result[block_id] = tmp;
-		sigm_der[block_id] = tmp*(1-tmp);
+		sigm_der[block_id] = tmp * (1 - tmp);
 	}
 
 }
 
-__global__ void feedforward(float* result, int rows, int cols,
-		float* matrix, float* vector, int multiplier,int size,float* biases,float* sigm_der){
+__global__ void feedforward(float* result, int rows, int cols, float* matrix,
+		float* vector, int multiplier, int size, float* biases,
+		float* sigm_der) {
 	int block_id = blockIdx.y * gridDim.x + blockIdx.x;
-	mull_feedforward_one_col(result,rows,cols,&matrix[block_id*size],vector,multiplier,size,biases[block_id],sigm_der);
+	mull_feedforward_one_col(result, rows, cols, &matrix[block_id * size],
+			vector, multiplier, size, biases[block_id], sigm_der);
+
+}
+
+__global__ void compute_d_L(float* a, float* y, float* sigm_der, float* d_L) {
+	extern __shared__ float shared[];
+
+	int thread_id = threadIdx.y * blockDim.x + threadIdx.x;
+	shared[thread_id] = a[thread_id];
+	shared[thread_id] = shared[thread_id] - y[thread_id];
+	shared[thread_id] = shared[thread_id] * sigm_der[thread_id];
+	d_L[thread_id] = shared[thread_id];
 }
 
 void cpu_feedforward(float* a_old, int rows, int cols, float** a_new, float* w,
@@ -143,21 +220,27 @@ float* hadamard_product(int size, float* a, float* b);
 void cpu_backpropagate(float* d_L, int rows, int cols, float** d_new,
 		float* sigm_der, float* w);
 void cuda_train(int num_of_layers, int* s, float** w, float** b, float** alfa,
-		float** delta, float** sigm_derivative);
+		float** delta, float** sigm_derivative,float* gpu_y,int* rows_for_backprop,cudaStream_t default_stream);
 
 int main(void) {
 	// SECTION 1 :
 	// define network's size :
 	int num_of_layers = 3;
 	int* s = new int[num_of_layers];	// size of layers
+	int* rows_for_backprop = new int[num_of_layers - 1];
+	rows_for_backprop[0] = 0;				// always zero , it's not used
+	rows_for_backprop[1] = 100;
 	s[0] = 784;
 	s[1] = 30;
 	s[2] = 10;
 
 	// SECTION 2 :
 	// define network's structures
-	float **w,**gpu_w;
-	float **b,**gpu_b, **sigm_derivative,**gpu_sigm_derivative, **delta,**gpu_delta, **alfa,**gpu_alfa;
+	float **w, **gpu_w;
+	float **b, **gpu_b, **sigm_derivative, **gpu_sigm_derivative, **delta,
+			**gpu_delta, **alfa, **gpu_alfa;
+	float* gpu_y;
+	cudaMalloc((void**) &gpu_y, sizeof(float) * (s[num_of_layers - 1]));
 	//float **c_w, **c_b;
 
 	w = new float*[num_of_layers];
@@ -185,7 +268,7 @@ int main(void) {
 	delta[0] = NULL;
 	for (int i = 1; i < num_of_layers; i++) {
 		w[i] = new float[s[i - 1] * s[i]];
-		cudaMalloc((void**) &gpu_w[i], sizeof(float) * (s[i-1]*s[i]));
+		cudaMalloc((void**) &gpu_w[i], sizeof(float) * (s[i - 1] * s[i]));
 		//c_w[i] = new float[s[i - 1] * s[i]];
 		sigm_derivative[i] = new float[s[i]];
 		cudaMalloc((void**) &gpu_sigm_derivative[i], sizeof(float) * (s[i]));
@@ -214,32 +297,36 @@ int main(void) {
 	cudaStreamCreate(&default_stream);
 
 	for (int i = 1; i < num_of_layers; i++) {
-		cudaMemcpyAsync(gpu_w[i], w[i], sizeof(float) * (s[i-1] * s[i]), cudaMemcpyHostToDevice,default_stream);
-		cudaMemcpyAsync(gpu_b[i], b[i], sizeof(float) * (s[i]), cudaMemcpyHostToDevice,default_stream);
+		cudaMemcpyAsync(gpu_w[i], w[i], sizeof(float) * (s[i - 1] * s[i]),
+				cudaMemcpyHostToDevice, default_stream);
+		cudaMemcpyAsync(gpu_b[i], b[i], sizeof(float) * (s[i]),
+				cudaMemcpyHostToDevice, default_stream);
 	}
 	cudaStreamSynchronize(default_stream);
 
 	// SECTION 4 :
 	// train function - missing : update_sums(...) and gradient_descent(...) (check c++ code in the other file)
 	struct timeval t1, t2;
-	double time, time_c, time_h;
+	double time_c, time_h;
 	gettimeofday(&t1, 0);
 	train(num_of_layers, s, w, b, alfa, delta, sigm_derivative);
 	gettimeofday(&t2, 0);
-	time_h = (1000000.0 * (t2.tv_sec - t1.tv_sec) + t2.tv_usec - t1.tv_usec)/ 1000.0;
+	time_c = (1000000.0 * (t2.tv_sec - t1.tv_sec) + t2.tv_usec - t1.tv_usec)
+			/ 1000.0;
 
 	gettimeofday(&t1, 0);
-	cuda_train(num_of_layers, s,gpu_w, b,gpu_alfa,gpu_delta,gpu_sigm_derivative);
+	cuda_train(num_of_layers, s, gpu_w, b, gpu_alfa, gpu_delta,gpu_sigm_derivative,gpu_y,rows_for_backprop,default_stream);
 	gettimeofday(&t2, 0);
-	time_c = (1000000.0 * (t2.tv_sec - t1.tv_sec) + t2.tv_usec - t1.tv_usec)/ 1000.0;
-	printf("gpu time %0.6f , cpu time %0.6f \n",time_h,time_c);
-	printf("Accelaration %0.6f %\n",((time_c-time_h)*2)/(time_h+time_c)*100);
+	time_h = (1000000.0 * (t2.tv_sec - t1.tv_sec) + t2.tv_usec - t1.tv_usec)
+			/ 1000.0;
+	printf("gpu time %0.6f , cpu time %0.6f \n", time_c, time_h);
+	printf("Accelaration %0.6f %\n", ((time_h / time_c) * 100));
 	printf("success\n");
 	return 0;
 }
 
 void cuda_train(int num_of_layers, int* s, float** w, float** b, float** alfa,
-		float** delta, float** sigm_derivative) {
+		float** delta, float** sigm_derivative,float* gpu_y,int* rows_for_backprop,cudaStream_t default_stream) {
 	// float learning_rate = 0.5;
 	int epochs = 1;
 	int batch_size = 1;
@@ -250,6 +337,10 @@ void cuda_train(int num_of_layers, int* s, float** w, float** b, float** alfa,
 	int multiplier;
 	float cache = 11000 * sizeof(float);
 	float* a = new float[s[0]];
+	int num_of_blocks;
+	int rows_per_block;
+	int last_block;
+	int size_for_last_block;
 	for (int ep = 0; ep < epochs; ep += (batch_size)) {
 		// reset_sums(); --> NO CUDA VERSION OF IT
 		for (int batch = 0; batch < batch_size; batch++) {
@@ -262,19 +353,48 @@ void cuda_train(int num_of_layers, int* s, float** w, float** b, float** alfa,
 			}
 			// same goes for yd (y desired) READING VERSION FOR .CU FILE ISN'T YET CREATED
 			yd = 0;
-			y = transformOutput(yd, s[num_of_layers - 1]);
 
 			// feedforward(&alfa[0]);
-			cudaMemcpy(alfa[0], a, sizeof(float) * (s[0]), cudaMemcpyHostToDevice);
+			cudaMemcpy(alfa[0], a, sizeof(float) * (s[0]),
+					cudaMemcpyHostToDevice);
 			for (int i = 1; i < num_of_layers; i++) {
 				multiplier = floor(s[i - 1] / numofthreads) + 1;
-				if (s[i-1] < numofthreads) {
+				if (s[i - 1] < numofthreads) {
 					multiplier = 1;
 				}
-				feedforward<<<s[i], numofthreads, cache>>>(alfa[i],numofthreads, s[i], w[i], alfa[i-1], multiplier, s[i-1],b[i], sigm_derivative[i]);
+				feedforward<<<s[i], numofthreads, cache>>>(alfa[i],
+						numofthreads, s[i], w[i], alfa[i - 1], multiplier,
+						s[i - 1], b[i], sigm_derivative[i]);
+				if (i == 1) {
+					// while gpu running , compute y and store it in cuda
+					y = transformOutput(yd, s[num_of_layers - 1]);
+					cudaMemcpyAsync(gpu_y, y,
+							sizeof(float) * (s[num_of_layers - 1]),
+							cudaMemcpyHostToDevice, default_stream);
+				}
 				cudaDeviceSynchronize();
-				// copy data back
+				// no need to copy data back -> all implementation in cuda
+			}
+			// wait for y copy - just to be sure - actually y copy must has been done way before you reach this statement
+			cudaStreamSynchronize (default_stream);
 
+			// feedforward completed, compute cost_derivative
+			compute_d_L<<<1, s[num_of_layers - 1],
+					s[num_of_layers - 1] * sizeof(float)>>>(
+					alfa[num_of_layers - 1], gpu_y,
+					sigm_derivative[num_of_layers - 1],
+					delta[num_of_layers - 1]);
+			cudaDeviceSynchronize();
+
+			// backpropagate the error
+
+			for (int i = num_of_layers - 2; i > 0; i--) {
+				rows_per_block = rows_for_backprop[i];
+				num_of_blocks = floor(s[i] / rows_per_block) + 1;
+				last_block = floor(s[i] / rows_per_block);
+				size_for_last_block = s[i] - floor(s[i] / rows_per_block) * rows_per_block;
+				backpropagate<<<num_of_blocks, rows_per_block, cache>>>(delta[i], rows_per_block, s[i+1], w[i + 1],delta[i + 1], last_block, size_for_last_block,sigm_derivative[i - 1]);
+				cudaDeviceSynchronize();
 			}
 
 			// update_sums(); --> NO CUDA VERSION OF IT
@@ -311,19 +431,19 @@ void train(int num_of_layers, int* s, float** w, float** b, float** alfa,
 						b[i], sigm_derivative[i]);
 			}
 			// NO TIME TO WRITE A CUDA IMPLEMENTATIION FOR THEM
-			/*
-			cost = cost_derivative(alfa[num_of_layers - 1], y,
-					s[num_of_layers - 1]);
 
-			delta[num_of_layers - 1] = hadamard_product(s[num_of_layers - 1],
-					cost, sigm_derivative[num_of_layers - 1]);
+			 cost = cost_derivative(alfa[num_of_layers - 1], y,
+			 s[num_of_layers - 1]);
 
-			// backpropagate(delta[num_of_layers-1]);
-			for (int i = num_of_layers - 2; i > 0; i--) {
-				cpu_backpropagate(delta[i + 1], s[i], s[i + 1], &delta[i],
-						sigm_derivative[i], w[i + 1]);
-			}
-			*/
+			 delta[num_of_layers - 1] = hadamard_product(s[num_of_layers - 1],
+			 cost, sigm_derivative[num_of_layers - 1]);
+
+			 // backpropagate(delta[num_of_layers-1]);
+			 for (int i = num_of_layers - 2; i > 0; i--) {
+			 cpu_backpropagate(delta[i + 1], s[i], s[i + 1], &delta[i],
+			 sigm_derivative[i], w[i + 1]);
+			 }
+
 			// update_sums(); --> NO CUDA VERSION OF IT
 		}
 		// gradient_descent(learning_rate, batch_size); --> NO CUDA VERSION OF IT
